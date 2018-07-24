@@ -127,8 +127,6 @@ static void display_friend_info(
 static void OnInviteRequest(ElaCarrier *w, const char *from,
                             const void *data, size_t len, void *context)
 {
-    ElaStreamType type = ElaStreamType_text;
-    int options = 0;
     char service[32] = {0};
     char port[8] = {0};
     char *tmp = NULL;
@@ -151,55 +149,23 @@ static void OnInviteRequest(ElaCarrier *w, const char *from,
     service_port = port;
     carrier->DistributeOnPortForwardingRequest(user_id, service_port, &accept);
     if (!accept) {
-        if (carrier->ReplyInvite(from, NULL, "refuse") < 0)
+        if (carrier->ReplyInvite(from, NULL, "refuse") < 0) {
             CARRIER_LOG("Reply invite request unsuccessfully.\n");
+            goto distribute_exit;
+        }
 
         goto return_exit;
     }
 
     // inform user when there is something wrong with session
-    carrier->SetPeerId(String(from));
-    if (carrier->InitSession() < 0) {
-        CARRIER_LOG("Open port forwarding unsuccessfully.\n");
+    if (carrier->ReplyInvite(from, "ok", NULL) < 0) {
         goto distribute_exit;
     }
 
-    if (carrier->NewSession(from) == NULL) {
-        CARRIER_LOG("Open port forwarding unsuccessfully.\n");
-        // close session, clean up session
-        goto close_exit;
-    }
-
-    // add service
-    if (carrier->AddService(service, "127.0.0.1", port) < 0) {
-        CARRIER_LOG("Open port forwarding unsuccessfully.\n");
-        // close session, clean up session
-        goto close_exit;
-    }
-
+    carrier->SetPeerId(String(from));
     carrier->SetUsedService(service);
     carrier->SetLocalPort(port);
-
-    options |= ELA_STREAM_RELIABLE;
-    options |= ELA_STREAM_MULTIPLEXING;
-    options |= ELA_STREAM_PORT_FORWARDING;
-
-    if (carrier->AddStream(type, options) < 0) {
-        CARRIER_LOG("Open port forwarding unsuccessfully.\n");
-        // remove service, close session, clean up session
-        goto remove_exit;
-    }
-
     goto return_exit;
-
-remove_exit:
-    carrier->RemoveService();
-    carrier->SetUsedService(NULL);
-    carrier->SetLocalPort(NULL);
-    carrier->SetRemotePort(NULL);
-
-close_exit:
-    carrier->CloseSession(TRUE);
 
 distribute_exit:
     carrier->DistributeOnPortForwardingResult(user_id, service_port, invalid_port, E_CARRIER_ERROR);
@@ -221,7 +187,6 @@ static void OnInviteResponse(
     String user_id(friend_id);
     String local_port;
     String remote_port;
-    Boolean close_session = TRUE;
     Boolean change_mode = FALSE;
 
     if (carrier == NULL)
@@ -235,15 +200,9 @@ static void OnInviteResponse(
 
         CARRIER_LOG("message within response: %.*s.\n", (int)len, (char*)data);
 
-        if (carrier->InitSession() < 0) {
-            CARRIER_LOG("Open port forwarding unsuccessfully.\n");
-            goto clean_exit;
-        }
-
         if (carrier->NewSession(friend_id) == NULL) {
             CARRIER_LOG("Open port forwarding unsuccessfully.\n");
-            close_session = FALSE;
-            goto close_exit;
+            goto clean_exit;
         }
 
         carrier->SetRunningMode(ACTIVE_MODE);
@@ -265,10 +224,7 @@ static void OnInviteResponse(
     }
 
 close_exit:
-    if (close_session)
-        carrier->CloseSession(TRUE);
-    else
-        carrier->CloseSession(TRUE, FALSE);
+    carrier->CloseSession();
 
     if (change_mode)
         carrier->SetRunningMode(PASSIVE_MODE);
@@ -292,37 +248,74 @@ static void OnSessionRequest(ElaCarrier *w, const char *from,
 {
     String remote_sdp(sdp, len);
     String user_id;
+    String service;
     String local_port;
     String remote_port;
-    char *reply_arg[1] = {NULL};
+    ElaStreamType type = ElaStreamType_text;
+    int options = 0;
+    int stream_id;
+    Boolean remove_stream = FALSE;
     CCarrier *carrier = CCarrier::GetLocalInstance();
 
     if (carrier == NULL)
-        return;
+        goto return_exit;
+
+    if (carrier->NewSession(from) == NULL) {
+        CARRIER_LOG("Open port forwarding unsuccessfully.\n");
+        goto clean_exit;
+    }
+
+    // add service
+    local_port = carrier->GetLocalPort();
+    service = carrier->GetUsedService();
+    if (carrier->AddService(service, "127.0.0.1", local_port) < 0) {
+        CARRIER_LOG("Open port forwarding unsuccessfully.\n");
+        // close session
+        goto close_exit;
+    }
+
+    options |= ELA_STREAM_RELIABLE;
+    options |= ELA_STREAM_MULTIPLEXING;
+    options |= ELA_STREAM_PORT_FORWARDING;
+
+    if ((stream_id = carrier->AddStream(type, options)) < 0) {
+        CARRIER_LOG("Open port forwarding unsuccessfully.\n");
+        // remove service, close session
+        goto close_exit;
+    }
 
     carrier->SetRemoteSdp(String(sdp));
     CARRIER_LOG("Session request from[%s] with SDP:\n%s.\n", from, remote_sdp.string());
+    goto return_exit;
 
-    reply_arg[0] = (char*)"ok";
-    if (carrier->ReplySessionRequest(1, reply_arg) < 0) {
-        CARRIER_LOG("Open port forwarding unsuccessfully.\n");
+close_exit:
+    carrier->CloseSession();
 
-        carrier->RemoveService();
-        carrier->SetUsedService(NULL);
-        carrier->SetLocalPort(NULL);
-        // close session, clean up session
-        carrier->CloseSession(TRUE);
-        user_id = from;
-        local_port = carrier->GetLocalPort();
-        remote_port = carrier->GetRemotePort();
-        carrier->DistributeOnPortForwardingResult(user_id, local_port, remote_port, E_CARRIER_ERROR);
+clean_exit:
+    carrier->RemoveService();
+    if (remove_stream) {
+        carrier->RemoveStream(stream_id);
+        carrier->SetRemoteSdp(String());
     }
+    carrier->SetPeerId(String());
+    carrier->SetUsedService(NULL);
+    carrier->SetLocalPort(NULL);
+    //carrier->SetRemotePort(NULL);
+
+distribute_exit:
+    user_id = from;
+    remote_port = carrier->GetRemotePort();
+    carrier->DistributeOnPortForwardingResult(user_id, local_port, remote_port, E_CARRIER_ERROR);
+
+return_exit:
+    return;
 }
 
 static void OnSessionRequestComplete(ElaSession *ws, int status,
                 const char *reason, const char *sdp, size_t len, void *context)
 {
     int rc = 0;
+    int stream_id = 0;
     String remote_sdp(sdp, len);
     String user_id;
     String service_port;
@@ -336,15 +329,26 @@ static void OnSessionRequestComplete(ElaSession *ws, int status,
            reason ? reason : "null");
 
     if (status != 0)
-        goto distribute_exit;
+        goto close_exit;
 
     carrier->SetRemoteSdp(remote_sdp);
-
-    rc = ela_session_start(ws, sdp, len);
-
-    CARRIER_LOG("Session start %s.\n", rc == 0 ? "successfully" : "unsuccessfully");
-    if (rc == 0)
+    rc = carrier->StartSession();
+    if (rc < 0)
+        goto close_exit;
+    else
         goto return_exit;
+
+close_exit:
+    stream_id = carrier->GetStreamId();
+    carrier->RemoveStream(stream_id);
+    carrier->CloseSession();
+
+clean_exit:
+    carrier->SetRunningMode(PASSIVE_MODE);
+    carrier->SetUsedService(NULL);
+    carrier->SetLocalPort(NULL);
+    carrier->SetRemotePort(NULL);
+    carrier->SetPeerId(String());
 
 distribute_exit:
     user_id = carrier->GetPeerId();
@@ -370,6 +374,7 @@ static void OnStreamStateChanged(ElaSession *ws, int stream,
     };
     RUNNING_MODE running_mode;
     Boolean remove_service = FALSE;
+    Boolean remove_stream = FALSE;
     Boolean change_mode = FALSE;
     Boolean is_successful = FALSE;
     String user_id;
@@ -383,10 +388,19 @@ static void OnStreamStateChanged(ElaSession *ws, int stream,
 
     running_mode = carrier->GetRunningMode();
     user_id = carrier->GetPeerId();
+    remote_port = carrier->GetRemotePort();
     CARRIER_LOG("Stream [%d] state changed to: %s.\n", stream, state_name[state]);
 
     if (state == ElaStreamState_transport_ready) {
-        carrier->SetReadyToStartSession(TRUE);
+        if (running_mode == PASSIVE_MODE) {
+            if (carrier->StartSession() < 0) {
+                remove_service = TRUE;
+                remove_stream = TRUE;
+                goto close_exit;
+            }
+        }
+        
+        goto return_exit;
     }
 
     if (state == ElaStreamState_initialized) {
@@ -394,12 +408,21 @@ static void OnStreamStateChanged(ElaSession *ws, int stream,
             if (carrier->RequestSession() < 0) {
                 CARRIER_LOG("Open port forwarding unsuccessfully.\n");
                 change_mode = TRUE;
+                remove_stream = TRUE;
                 goto close_exit;
+            } else {
+                goto return_exit;
             }
         } else if (running_mode == PASSIVE_MODE) {
-            if (carrier->ReplyInvite(user_id.string(), "ok", NULL) < 0) {
+            char *reply_arg[1] = {NULL};
+            reply_arg[0] = (char *)"ok";
+            if (carrier->ReplySessionRequest(1, reply_arg) < 0) {
+                CARRIER_LOG("Open port forwarding unsuccessfully.\n");
                 remove_service = TRUE;
+                remove_stream = TRUE;
                 goto close_exit;
+            } else {
+                goto return_exit;
             }
         } else {
             // Impossible to be here.
@@ -415,6 +438,7 @@ static void OnStreamStateChanged(ElaSession *ws, int stream,
             if (rc <= 0) {
                 CARRIER_LOG("Open port forwarding unsuccessfully.\n");
                 change_mode = TRUE;
+                remove_stream = TRUE;
                 goto close_exit;
             }
 
@@ -424,31 +448,36 @@ static void OnStreamStateChanged(ElaSession *ws, int stream,
             CARRIER_LOG("Port forwarding was successfully established.\n");
             goto distribute_exit;
         } else {
-            // Do nothing.
-            goto return_exit;
+            code = NOERROR;
+            carrier->SetPortForwardingSuccessful(TRUE);
+            CARRIER_LOG("Port forwarding was successfully established.\n");
+            goto distribute_exit;
         }
     } else {
-        // Do nothing.
         goto return_exit;
     }
 
 close_exit:
-    carrier->CloseSession(TRUE);
+    if (remove_stream) {
+        int stream_id = carrier->GetStreamId();
+        carrier->RemoveStream(stream_id);
+    }
 
-clean_exit:
     if (remove_service)
         carrier->RemoveService();
 
+    carrier->CloseSession();
+
+clean_exit:
     if (change_mode) {
         carrier->SetRunningMode(PASSIVE_MODE);
-        remote_port = carrier->GetRemotePort();
-    } else {
-        remote_port = INVALID_PORT;
+        remote_port = String(INVALID_PORT);
     }
 
     carrier->SetUsedService(NULL);
     carrier->SetLocalPort(NULL);
     carrier->SetRemotePort(NULL);
+    carrier->SetRemoteSdp(String());
     carrier->SetPeerId(String());
 
 distribute_exit:
@@ -457,16 +486,6 @@ distribute_exit:
 
 return_exit:
     return;
-}
-
-void CCarrier::SetReadyToStartSession(Boolean is_ready)
-{
-    mReadyToStartSession = is_ready;
-}
-
-Boolean CCarrier::GetReadyToStartSession()
-{
-    return mReadyToStartSession;
 }
 
 ElaSession *CCarrier::GetSession()
@@ -573,7 +592,7 @@ int CCarrier::InitSession()
 {
     int rc = 0;
 
-    rc = ela_session_init(mElaCarrier, OnSessionRequest,mElaCarrier);
+    rc = ela_session_init(mElaCarrier, OnSessionRequest, mElaCarrier);
     if (rc < 0) {
         CARRIER_LOG("Session initialized unsuccessfully(0x%x).\n", ela_get_error());
     } else {
@@ -597,13 +616,24 @@ ElaSession *CCarrier::NewSession(const char *friend_id)
     return mSession;
 }
 
-void CCarrier::CloseSession(Boolean cleanup, Boolean close)
+int CCarrier::StartSession()
 {
-    if (close)
-        ela_session_close(mSession);
+    int rc = 0;
 
-    if (cleanup)
-        ela_session_cleanup(mElaCarrier);
+    rc = ela_session_start(mSession, mRemoteSdp.string(),
+                           mRemoteSdp.GetLength());
+    if (rc < 0) {
+        CARRIER_LOG("Session started unsuccessfully(0x%x).\n", ela_get_error());
+    } else {
+        CARRIER_LOG("Session started successfully.\n");
+    }
+
+    return rc;
+}
+
+void CCarrier::CloseSession()
+{
+    ela_session_close(mSession);
 }
 
 int CCarrier::RequestSession()
@@ -632,26 +662,19 @@ int CCarrier::ReplySessionRequest(int argc, char *argv[])
     if ((strcmp(argv[0], "ok") == 0) && (argc == 1)) {
         rc = ela_session_reply_request(mSession, 0, NULL);
         if (rc < 0) {
-            CARRIER_LOG("response invite unsuccessfully.\n");
+            CARRIER_LOG("reply session request unsuccessfully.\n");
         } else {
-            CARRIER_LOG("response invite successfully.\n");
+            CARRIER_LOG("reply session request successfully.\n");
 
-            while (!mReadyToStartSession)
-                usleep(200);
-
-            rc = ela_session_start(mSession, mRemoteSdp.string(),
-                                       mRemoteSdp.GetLength());
-
-            CARRIER_LOG("Session start %s.\n", rc == 0 ? "successfully" : "unsuccessfully");
         }
 
         return rc;
     } else if ((strcmp(argv[0], "refuse") == 0) && (argc == 2)) {
         rc = ela_session_reply_request(mSession, 1, argv[2]);
         if (rc < 0) {
-            CARRIER_LOG("response invite unsuccessfully.\n");
+            CARRIER_LOG("reply session request unsuccessfully.\n");
         } else {
-            CARRIER_LOG("response invite successfully.\n");
+            CARRIER_LOG("reply session request successfully.\n");
         }
 
         return rc;
@@ -719,8 +742,25 @@ int CCarrier::AddStream(ElaStreamType type, int options)
     if (rc < 0) {
         CARRIER_LOG("Add stream unsuccessfully(0x%x).\n", ela_get_error());
     } else {
-        CARRIER_LOG("Add stream successfully and stream id %d.\n", rc);
+        CARRIER_LOG("Add stream successfully and stream id is %d.\n", rc);
         mStreamId = rc;
+    }
+
+    return rc;
+}
+
+int CCarrier::RemoveStream(int stream_id)
+{
+    int rc = 0;
+
+    assert(stream_id  > 0);
+
+    rc = ela_session_remove_stream(mSession, stream_id);
+    if (rc < 0) {
+        CARRIER_LOG("Remove stream unsuccessfully(0x%x).\n", ela_get_error());
+    } else {
+        CARRIER_LOG("Remove stream successfully and stream id is %d.\n", stream_id);
+        mStreamId = -1;
     }
 
     return rc;
@@ -747,7 +787,7 @@ void CCarrier::RemoveService()
 }
 
 int CCarrier::OpenPortForwarding(int stream, const char *service,
-                                const char *host, const char *port, PortForwardingProtocol protocol)
+                                 const char *host, const char *port, PortForwardingProtocol protocol)
 {
     int rc = 0;
 
@@ -762,8 +802,8 @@ int CCarrier::OpenPortForwarding(int stream, const char *service,
     if (rc <= 0) {
         CARRIER_LOG("Open portforwarding for service %s on %s:%s unsuccessfully(%08X).\n",
               service, "127.0.0.1", port, ela_get_error());
-        // close session, clean up session
-        CCarrier::GetLocalInstance()->CloseSession(TRUE);
+        // close session
+        CCarrier::GetLocalInstance()->CloseSession();
     } else {
         CARRIER_LOG("Open portforwarding for service %s on %s:%s successfully.\n",
               mUsedService.string(), "127.0.0.1", mLocalPort.string());
@@ -834,7 +874,6 @@ CCarrier::CCarrier()
     pthread_mutex_init(&mFriendListLock, &recursiveAttr);
     pthread_mutexattr_destroy(&recursiveAttr);
 
-    mReadyToStartSession = FALSE;
     mSession = NULL;
     mRunningMode = PASSIVE_MODE;
     mOpenPortForwardingSuccessfully = FALSE;
@@ -947,6 +986,7 @@ ECode CCarrier::Start(
 void *CCarrier::CarrierThread(void *arg)
 {
     CCarrier* proxy = (CCarrier *)arg;
+    int rc = 0;
     ElaCallbacks callbacks;
     memset(&callbacks, 0, sizeof(callbacks));
     callbacks.idle = OnIdle;
@@ -967,6 +1007,7 @@ void *CCarrier::CarrierThread(void *arg)
     opts.bootstraps = (BootstrapNode *)calloc(opts.bootstraps_size, sizeof(BootstrapNode) * 1);
     if (!opts.bootstraps) {
         CARRIER_LOG("out of memory.\n");
+        proxy->mDataPath = "";
         return NULL;
     }
 
@@ -993,7 +1034,21 @@ void *CCarrier::CarrierThread(void *arg)
     proxy->mElaCarrier = ela_new(&opts, &callbacks, NULL);
     if (proxy->mElaCarrier == NULL) {
         CARRIER_LOG("Error start carrier loop: 0x%x\n", ela_get_error());
+        proxy->mDataPath = "";
+        free(opts.bootstraps);
         return NULL;
+    }
+
+    rc = ela_session_init(proxy->mElaCarrier, OnSessionRequest, proxy->mElaCarrier);
+    if (rc < 0) {
+        CARRIER_LOG("Session initialized unsuccessfully(0x%x).\n", ela_get_error());
+        ela_kill(proxy->mElaCarrier);
+        proxy->mElaCarrier = NULL;
+        proxy->mDataPath = "";
+        free(opts.bootstraps);
+        return NULL;
+    } else {
+        CARRIER_LOG("Session initialized successfully.\n");
     }
 
     char buf[ELA_MAX_ADDRESS_LEN + 1];
@@ -1002,12 +1057,14 @@ void *CCarrier::CarrierThread(void *arg)
     CARRIER_LOG("   User ID: %s\n", ela_get_userid(proxy->mElaCarrier, buf, sizeof(buf)));
     CARRIER_LOG("   Address: %s\n\n", ela_get_address(proxy->mElaCarrier, buf, sizeof(buf)));
 
-    int rc = ela_run(proxy->mElaCarrier, 10);
+    rc = ela_run(proxy->mElaCarrier, 10);
     if (rc != 0) {
         CARRIER_LOG("Error start carrier loop: 0x%x\n", ela_get_error());
         ela_kill(proxy->mElaCarrier);
+        ela_session_cleanup(proxy->mElaCarrier);
         proxy->mElaCarrier = NULL;
         proxy->mDataPath = "";
+        free(opts.bootstraps);
     }
 
     return NULL;
@@ -1017,6 +1074,7 @@ ECode CCarrier::Stop()
 {
     if (mElaCarrier != NULL) {
         ela_kill(mElaCarrier);
+        ela_session_cleanup(mElaCarrier);
         mElaCarrier = NULL;
     }
 
@@ -1024,8 +1082,6 @@ ECode CCarrier::Stop()
     m_carrierThreadId = 0;
 
     mDataPath = "";
-
-    ClosePortForwarding(String(), String(), String());
 
     return NOERROR;
 }
@@ -1279,6 +1335,7 @@ CARAPI CCarrier::OpenPortForwarding(
     char hello[32] = {0};
     char buf[64] = {0};
     time_t seconds = 0;
+    String service;
 
     CARRIER_NOT_READY();
     VALIDATE_NOT_NULL(localPort.string());
@@ -1296,12 +1353,13 @@ CARAPI CCarrier::OpenPortForwarding(
 
     time(&seconds);
     sprintf(buf, "%ld%s%s%s", (long)seconds, localPort.string(), "to", remotePort.string());
-    mUsedService = String(buf, strlen(buf));
-    sprintf(hello, "%s:%s", mUsedService.string(), remotePort.string());
+    service = String(buf, strlen(buf));
+    sprintf(hello, "%s:%s", service.string(), remotePort.string());
     if (Invite(uid.string(), hello) < 0) {
         return E_INVITE;
     }
 
+    mUsedService = service;
     mLocalPort = localPort;
     mRemotePort = remotePort;
 
@@ -1322,13 +1380,6 @@ CARAPI CCarrier::ClosePortForwarding(
                                      mPortForwardingId);
     if (rc < 0)
         return E_CLOSE_PORT_FORWARDING;
-
-    rc = ela_session_remove_stream(mSession, mStreamId);
-    if (rc < 0)
-        return E_REMOVE_STREAM;
-
-    ela_session_close(mSession);
-    ela_session_cleanup(mElaCarrier);
 
     return NOERROR;
 }

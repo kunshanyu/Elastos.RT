@@ -258,12 +258,14 @@ public:
     void SetRemotePort(const char *remote_port);
     int InitSession();
     ElaSession *NewSession(const char *friend_id);
-    void CloseSession(Boolean cleanup, Boolean close = TRUE);
+    int StartSession();
+    void CloseSession();
     int RequestSession();
     int ReplySessionRequest(int argc, char *argv[]);
     int Invite(const char *friend_id, const char *hello);
     int ReplyInvite(const char *friend_id, const char *msg, const char *reason);
     int AddStream(ElaStreamType type, int options);
+    int RemoveStream(int stream_id);
     int AddService(const char *service, const char *host, const char *port);
     void RemoveService();
     int OpenPortForwarding(int stream, const char *service,
@@ -291,7 +293,6 @@ private:
     //Carrier is ready
     Boolean mIsReady;
 
-    Boolean mReadyToStartSession;
     ElaSession *mSession;
     String mRemoteSdp;
     RUNNING_MODE mRunningMode;
